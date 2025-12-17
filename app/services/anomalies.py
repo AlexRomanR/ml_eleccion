@@ -1,13 +1,9 @@
-# app.py
-from fastapi import FastAPI
 import pandas as pd
 import numpy as np
-from db import get_engine
+from app.db import get_engine
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 from sqlalchemy import text
-
-app = FastAPI()
 
 SQL_FEATURES = """
 WITH ultima_col AS (
@@ -122,15 +118,10 @@ def _build_recommendation(row, p90_dias, p90_cycle):
         sug = "revisar"
     return motivos, sug
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.get("/anomalies/scan")
-def scan(project_id: int, contamination: float = 0.1):
+def run_anomaly_scan(project_id: int, contamination: float = 0.1):
     df, X, feats = load_features(project_id)
     if df.empty or len(df) < 8:
-        return {"project_id": project_id, "anomalies": []}
+        return []
 
     p90_dias = float(np.percentile(X["dias_sin_mov"], 90))
     p90_cycle = float(np.percentile(X["cycle_days"], 90))
@@ -166,4 +157,4 @@ def scan(project_id: int, contamination: float = 0.1):
         })
 
     items = sorted(items, key=lambda x: x["score"])  # más anómala primero
-    return {"project_id": project_id, "anomalies": items[:50]}
+    return items[:50]

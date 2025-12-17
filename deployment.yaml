@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-microservice
+  labels:
+    app: ml-microservice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ml-microservice
+  template:
+    metadata:
+      labels:
+        app: ml-microservice
+    spec:
+      containers:
+        - name: ml-microservice
+          image: ml-microservice:latest # Reemplazar con tag real si se sube a registry
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+          env:
+            # Ejemplo de cómo pasar variables de entorno (DB, API Keys)
+            # Se recomienda usar Secret o ConfigMap en producción real
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ml-secrets
+                  key: gemini-api-key
+                  optional: true
+          # Límites generosos para Deep Learning (KerasOCR/Tensorflow pueden ser pesados en memoria)
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-microservice-svc
+spec:
+  type: ClusterIP
+  selector:
+    app: ml-microservice
+  ports:
+    - protocol: TCP
+      port: 5000 # Puerto expuesto dentro del cluster
+      targetPort: 5000 # Puerto del contenedor
