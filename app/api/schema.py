@@ -62,6 +62,7 @@ class AnomalySummary:
 @strawberry.type
 class AnomalyItem:
     tarea_id: int
+    titulo: typing.Optional[str]  
     score: float
     motivos: typing.List[str]
     sugerencia: str
@@ -93,6 +94,7 @@ class Query:
             anomalies_objs.append(
                 AnomalyItem(
                     tarea_id=item["tarea_id"],
+                    titulo=item.get("titulo"),   # ✅ nuevo
                     score=item["score"],
                     motivos=item["motivos"],
                     sugerencia=item["sugerencia"],

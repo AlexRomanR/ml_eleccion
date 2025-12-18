@@ -5,7 +5,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 from sqlalchemy import text
 
-SQL_FEATURES = """
+# --- versión con título (si tu tabla tarea tiene columna "titulo") ---
+SQL_FEATURES_V2 = """
 WITH ultima_col AS (
   SELECT c.proyecto_id, MAX(c.orden) AS max_orden
   FROM columna_kanban c
@@ -68,6 +69,7 @@ cycle AS (
 )
 SELECT
   t.id AS tarea_id,
+  t.titulo AS titulo,
   COALESCE(d.dias_sin_mov, 0) AS dias_sin_mov,
   COALESCE(b.back_moves, 0)   AS back_moves,
   COALESCE(r.reopen_expl, 0)  AS reopen_expl,
@@ -82,79 +84,114 @@ LEFT JOIN cycle c ON c.tarea_id = t.id
 WHERE t.proyecto_id = :proyectoId;
 """
 
-def _prioridad_num(s):
-    if s == "Alta": return 3
-    if s == "Baja": return 1
-    return 2
+# --- fallback si en tu BD no existe "t.titulo" (para que no crashee) ---
+SQL_FEATURES_FALLBACK = SQL_FEATURES_V2.replace("t.titulo AS titulo,\n", "")
 
-def load_features(project_id:int):
-    eng = get_engine()
-    df = pd.read_sql(text(SQL_FEATURES), eng, params={"proyectoId": project_id})
-    if df.empty:
-        return df, pd.DataFrame(), []
-    df["cycle_days"] = df["cycle_days"].fillna(df["cycle_days"].median())
-    df["prioridad_num"] = df["prioridad"].map(_prioridad_num).fillna(2).astype(float)
-    for c in ["dias_sin_mov","back_moves","reopen_expl","cycle_days","puntos","prioridad_num"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    feats = ["dias_sin_mov","back_moves","reopen_expl","cycle_days","puntos","prioridad_num"]
-    X = df[feats].astype(float)
-    return df, X, feats
+MOTIVO_LABEL = {
+  "estancada": "Estancada (muchos días sin movimiento)",
+  "reopen_excesivo": "Reaperturas excesivas desde Hecho",
+  "ping_pong": "Va y vuelve entre columnas (ping-pong)",
+  "ciclo_largo": "Ciclo de trabajo largo",
+}
+
+def _human(s: str) -> str:
+  # fallback genérico: quita "_" y capitaliza
+  return (s or "").replace("_", " ").strip().capitalize()
+
+def _prioridad_num(s):
+  if s == "Alta": return 3
+  if s == "Baja": return 1
+  return 2
+
+def load_features(project_id: int):
+  eng = get_engine()
+
+  # intenta con título, si falla usa fallback
+  try:
+    df = pd.read_sql(text(SQL_FEATURES_V2), eng, params={"proyectoId": project_id})
+  except Exception:
+    df = pd.read_sql(text(SQL_FEATURES_FALLBACK), eng, params={"proyectoId": project_id})
+
+  if df.empty:
+    return df, pd.DataFrame(), []
+
+  # cycle_days robusto
+  med = df["cycle_days"].median()
+  if pd.isna(med): med = 0.0
+  df["cycle_days"] = df["cycle_days"].fillna(med)
+
+  df["prioridad_num"] = df["prioridad"].map(_prioridad_num).fillna(2).astype(float)
+  for c in ["dias_sin_mov","back_moves","reopen_expl","cycle_days","puntos","prioridad_num"]:
+    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+  feats = ["dias_sin_mov","back_moves","reopen_expl","cycle_days","puntos","prioridad_num"]
+  X = df[feats].astype(float)
+  return df, X, feats
 
 def _build_recommendation(row, p90_dias, p90_cycle):
-    motivos = []
-    if row["dias_sin_mov"] >= p90_dias: motivos.append("estancada")
-    if row["reopen_expl"] >= 2: motivos.append("reopen_excesivo")
-    if row["back_moves"] >= 3: motivos.append("ping_pong")
-    if row["cycle_days"] >= p90_cycle: motivos.append("ciclo_largo")
-    if "estancada" in motivos:
-        sug = "subir_prioridad o partir_tarea"
-    elif "reopen_excesivo" in motivos:
-        sug = "agregar_revisor o partir_tarea"
-    elif "ciclo_largo" in motivos:
-        sug = "partir_tarea o reforzar_equipo"
-    elif "ping_pong" in motivos:
-        sug = "clarificar_alcance o pair_programming"
-    else:
-        sug = "revisar"
-    return motivos, sug
+  motivos_code = []
+  if row["dias_sin_mov"] >= p90_dias: motivos_code.append("estancada")
+  if row["reopen_expl"] >= 2:         motivos_code.append("reopen_excesivo")
+  if row["back_moves"] >= 3:          motivos_code.append("ping_pong")
+  if row["cycle_days"] >= p90_cycle:  motivos_code.append("ciclo_largo")
+
+  # ✅ textos legibles
+  motivos_txt = [MOTIVO_LABEL.get(m, _human(m)) for m in motivos_code]
+
+  # ✅ sugerencias legibles (sin "_")
+  if "estancada" in motivos_code:
+    sug = "Subir prioridad o partir la tarea en subtareas."
+  elif "reopen_excesivo" in motivos_code:
+    sug = "Agregar revisión/QA y aclarar criterios de terminado."
+  elif "ciclo_largo" in motivos_code:
+    sug = "Partir la tarea o reforzar el equipo; revisar bloqueos."
+  elif "ping_pong" in motivos_code:
+    sug = "Clarificar alcance y criterios; considerar pair programming."
+  else:
+    sug = "Revisar."
+
+  return motivos_txt, sug
 
 def run_anomaly_scan(project_id: int, contamination: float = 0.1):
-    df, X, feats = load_features(project_id)
-    if df.empty or len(df) < 8:
-        return []
+  df, X, feats = load_features(project_id)
+  if df.empty or len(df) < 8:
+    return []
 
-    p90_dias = float(np.percentile(X["dias_sin_mov"], 90))
-    p90_cycle = float(np.percentile(X["cycle_days"], 90))
+  p90_dias  = float(np.percentile(X["dias_sin_mov"], 90))
+  p90_cycle = float(np.percentile(X["cycle_days"], 90))
 
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
+  scaler = StandardScaler()
+  Xs = scaler.fit_transform(X)
 
-    iforest = IsolationForest(n_estimators=200, contamination=contamination, random_state=42)
-    lbl = iforest.fit_predict(Xs)          # -1 = anómala
-    score = iforest.decision_function(Xs)  # más bajo = más raro
+  iforest = IsolationForest(n_estimators=200, contamination=contamination, random_state=42)
+  lbl = iforest.fit_predict(Xs)
+  score = iforest.decision_function(Xs)
 
-    df["is_anomaly"] = (lbl == -1).astype(int)
-    df["score"] = score
+  df["is_anomaly"] = (lbl == -1).astype(int)
+  df["score"] = score
 
-    items = []
-    for _, r in df.iterrows():
-        if int(r["is_anomaly"]) != 1:
-            continue
-        motivos, sugerencia = _build_recommendation(r, p90_dias, p90_cycle)
-        items.append({
-            "tarea_id": int(r["tarea_id"]),
-            "score": float(r["score"]),
-            "motivos": motivos,
-            "sugerencia": sugerencia,
-            "resumen": {
-                "dias_sin_mov": int(r["dias_sin_mov"]),
-                "back_moves": int(r["back_moves"]),
-                "reopen_expl": int(r["reopen_expl"]),
-                "cycle_days": float(r["cycle_days"]),
-                "prioridad": str(r["prioridad"]),
-                "puntos": int(r["puntos"])
-            }
-        })
+  items = []
+  for _, r in df.iterrows():
+    if int(r["is_anomaly"]) != 1:
+      continue
 
-    items = sorted(items, key=lambda x: x["score"])  # más anómala primero
-    return items[:50]
+    motivos, sugerencia = _build_recommendation(r, p90_dias, p90_cycle)
+
+    items.append({
+      "tarea_id": int(r["tarea_id"]),
+      "titulo": (str(r["titulo"]) if "titulo" in df.columns and pd.notna(r.get("titulo")) else None),
+      "score": float(r["score"]),
+      "motivos": motivos,          # ✅ ya vienen “bonitos”
+      "sugerencia": sugerencia,    # ✅ ya viene “bonita”
+      "resumen": {
+        "dias_sin_mov": int(r["dias_sin_mov"]),
+        "back_moves": int(r["back_moves"]),
+        "reopen_expl": int(r["reopen_expl"]),
+        "cycle_days": float(r["cycle_days"]),
+        "prioridad": str(r["prioridad"]),
+        "puntos": int(r["puntos"])
+      }
+    })
+
+  items = sorted(items, key=lambda x: x["score"])
+  return items[:50]
