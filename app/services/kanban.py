@@ -1,222 +1,281 @@
-import io
-import os
-import json
-import base64
-import requests
+# app/services/kanban.py
+import re
+import cv2
 import numpy as np
 import keras_ocr
-from PIL import Image
-from sklearn.cluster import DBSCAN
-from dotenv import load_dotenv
 
-load_dotenv()
+_PIPELINE = None
 
-# Initialize pipeline once
-_pipeline = keras_ocr.pipeline.Pipeline()
+DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+EMAIL_RE = re.compile(r"\b\S+@\S+\.\S+\b", re.IGNORECASE)
+
+PRIORITY_MAP = {
+    "BAJA": "BAJA",
+    "MEDIA": "MEDIA",
+    "ALTA": "ALTA",
+}
+
+def _get_pipeline():
+    global _PIPELINE
+    if _PIPELINE is None:
+        _PIPELINE = keras_ocr.pipeline.Pipeline()
+    return _PIPELINE
+
+
+def _box_center(box):
+    # box: (4,2)
+    x = float(np.mean(box[:, 0]))
+    y = float(np.mean(box[:, 1]))
+    return x, y
+
+
+def _sort_reading_order(preds):
+    """
+    preds: list[(text, box)]
+    Devuelve lista ordenada por y y luego x (lectura aproximada).
+    """
+    items = []
+    for text, box in preds:
+        cx, cy = _box_center(box)
+        items.append((cy, cx, text.strip()))
+    items.sort(key=lambda t: (t[0], t[1]))
+    return [t[2] for t in items if t[2]]
+
+
+def _clean_header_text(words):
+    # filtramos numeritos y cosas cortas
+    candidates = []
+    for w in words:
+        w2 = w.strip()
+        if not w2:
+            continue
+        if w2.isdigit():
+            continue
+        if len(w2) <= 1:
+            continue
+        # evita "Agregar" en header si apareciera raro
+        if "agregar" in w2.lower():
+            continue
+        candidates.append(w2)
+
+    # en tu UI el header es una sola palabra o 2 ("Por hacer")
+    # nos quedamos con lo más largo, o unimos 2 primeras si hace sentido
+    if not candidates:
+        return "Columna"
+
+    # si hay 2 palabras con y parecida, keras_ocr puede separarlo: "Por" "hacer"
+    # unimos si hay exactamente 2 y ninguna es muy larga
+    if len(candidates) >= 2:
+        joined = " ".join(candidates[:2])
+        # heurística: si parece "Por hacer"
+        if len(joined) <= 20:
+            # preferir join si no es basura
+            if any(c.isalpha() for c in joined):
+                return joined
+
+    return max(candidates, key=len)
+
+
+def _find_columns_by_white_body(img_bgr):
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    # blanco: baja saturación, alto valor
+    mask = cv2.inRange(hsv, (0, 0, 180), (179, 45, 255))
+
+    H, W = mask.shape
+    mask[: int(H * 0.12), :] = 0  # quitamos cabecera
+
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=2)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    rects = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        area = w * h
+        if area > 50000 and h > int(H * 0.35) and w > int(W * 0.12):
+            rects.append((x, y, w, h, area))
+
+    rects = sorted(rects, key=lambda r: r[0])  # por X (izq→der)
+
+    # ✅ YA NO recortes a 3: retorna todas
+    return [(x, y, w, h) for (x, y, w, h, _) in rects]
+
+
+def _find_cards_in_column(col_bgr):
+    """
+    Busca rectángulos internos (cards) dentro del cuerpo de una columna.
+    Usa threshold adaptativo para capturar bordes suaves.
+    """
+    gray = cv2.cvtColor(col_bgr, cv2.COLOR_BGR2GRAY)
+
+    th = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5
+    )
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2)
+
+    H, W = gray.shape[:2]
+    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    cards = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        area = w * h
+
+        # filtrar: muy chico / muy grande (la columna entera)
+        if area < 12000:
+            continue
+        if w > int(W * 0.95) and h > int(H * 0.95):
+            continue
+
+        # card típica: bastante ancha y alta
+        if w > int(W * 0.65) and h > int(H * 0.20):
+            cards.append((x, y, w, h, area))
+
+    # ordenar por Y (de arriba hacia abajo)
+    cards.sort(key=lambda r: r[1])
+    return [(x, y, w, h) for (x, y, w, h, _) in cards]
+
+DATE_FUZZY = re.compile(r"\b(20\d{2})\s*[-/–]\s*(\d{2})\s*[-/–]\s*(\d{2})\b")
+PTS_IN_TEXT = re.compile(r"(?<!#)\b(\d{1,3})\b\s*(?:pts|puntos?)\b", re.IGNORECASE)
+NUM_ANY = re.compile(r"(?<!#)\b(\d{1,3})\b")
+
+def _parse_task_from_words(words):
+    cleaned = []
+    for w in words:
+        w2 = w.strip()
+        if not w2:
+            continue
+        if EMAIL_RE.search(w2):
+            continue
+        if "agregar" in w2.lower() and "tarea" in w2.lower():
+            continue
+        cleaned.append(w2)
+
+    joined = " ".join(cleaned)
+
+    # ---- fecha (YYYY-MM-DD) robusta ----
+    fecha = None
+    m = DATE_FUZZY.search(joined)
+    if m:
+        fecha = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # ---- prioridad ----
+    prioridad = None
+    for w in cleaned:
+        up = w.upper()
+        if up in PRIORITY_MAP:
+            prioridad = PRIORITY_MAP[up]
+            break
+
+    # ---- puntos: 1) si aparece "X puntos" en el texto ----
+    puntos = None
+    m = PTS_IN_TEXT.search(joined)
+    if m:
+        n = int(m.group(1))
+        if 0 <= n <= 500:
+            puntos = n
+
+    # ---- puntos: 2) fallback buscando cualquier numerito suelto (evita años grandes) ----
+    if puntos is None:
+        # buscamos candidatos, evitando tokens que parecen fecha completa
+        candidates = []
+        for w in cleaned:
+            if DATE_FUZZY.search(w):
+                continue
+            for s in NUM_ANY.findall(w):
+                n = int(s)
+                if 0 <= n <= 500 and n < 1900:   # evita 2025
+                    candidates.append(n)
+        if candidates:
+            # normalmente el punto es el número “chico” (5,6,8,50, etc.)
+            puntos = min(candidates)
+
+    # ---- título/desc ----
+    def is_noise(x):
+        if DATE_FUZZY.search(x): return True
+        if x.upper() in PRIORITY_MAP: return True
+        # no filtres números aquí, porque el título puede tener "#7" y no importa
+        return False
+
+    text_lines = [w for w in cleaned if not is_noise(w)]
+    titulo = text_lines[0] if text_lines else "Tarea"
+    descripcion = text_lines[1] if len(text_lines) >= 2 else None
+
+    return {
+        "titulo": titulo,
+        "descripcion": descripcion,
+        "prioridad": prioridad,
+        "puntos": puntos,
+        "fechaLimite": fecha,
+    }
+
 
 class KanbanExtractor:
-    def __init__(self):
-        self.pipeline = _pipeline
-        self.gemini_key = os.getenv("GEMINI_API_KEY")
-
     def extract_from_bytes(self, image_bytes):
-        # 1. Try Local Extraction
-        print("Starting Local OCR extraction...")
-        local_result = self._extract_local(image_bytes)
-        
-        # 2. Validation / Quality Check
-        # Heuristic: If we found less than 2 columns or 0 tasks, it's probably wrong.
-        col_count = len(local_result['columns'])
-        total_tasks = sum(len(c['tasks']) for c in local_result['columns'])
-        
-        is_poor_quality = col_count < 2 or total_tasks == 0
-        
-        if is_poor_quality:
-            print(f"Local OCR incomplete (Cols: {col_count}, Tasks: {total_tasks}). Attempting Fallback...")
-            if self.gemini_key:
-                try:
-                    return self._call_gemini_fallback(image_bytes)
-                except Exception as e:
-                    print(f"Gemini Fallback failed: {e}")
-                    # If fallback fails, return local result anyway (better than crash)
-                    return local_result
-            else:
-                print("No GEMINI_API_KEY found. Returning local result.")
-        
-        return local_result
+        # decode bytes -> cv2 image
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return {"error": "Could not decode image"}
 
-    def _extract_local(self, image_bytes):
-        image = keras_ocr.tools.read(io.BytesIO(image_bytes))
-        prediction_groups = self.pipeline.recognize([image])
-        predictions = prediction_groups[0]
+        cols = _find_columns_by_white_body(img)
+        if len(cols) < 2:
+            return {"error": "No se detectaron columnas suficientes"}
 
-        if not predictions:
-            return self._empty_structure()
+        pipe = _get_pipeline()
 
-        elements = []
-        for text, box in predictions:
-            center = np.mean(box, axis=0)
-            elements.append({
-                'text': text,
-                'center_x': center[0],
-                'center_y': center[1],
-                'height': np.max(box[:, 1]) - np.min(box[:, 1]),
-                'box': box
-            })
+        out_cols = []
+        for (x, y, w, h) in cols:
+            # header: zona encima del cuerpo
+            header_y0 = 0
+            header_y1 = max(0, y)  # hasta donde empieza el blanco
+            header = img[header_y0:header_y1, x:x + w]
 
-        return self._structure_data(elements, image.shape[1], image.shape[0])
+            # cuerpo de columna (blanco)
+            body = img[y:y + h, x:x + w]
 
-    def _structure_data(self, elements, width, height):
-        header_thresh = height * 0.15
-        header_elems = [e for e in elements if e['center_y'] < header_thresh]
-        body_elems = [e for e in elements if e['center_y'] >= header_thresh]
+            # OCR header
+            header_rgb = cv2.cvtColor(header, cv2.COLOR_BGR2RGB)
+            header_preds = pipe.recognize([header_rgb])[0] if header_rgb.size else []
+            header_words = _sort_reading_order(header_preds)
+            col_name = _clean_header_text(header_words)
 
-        project_name = "Proyecto Detectado"
-        if header_elems:
-            header_elems.sort(key=lambda x: x['height'], reverse=True)
-            project_name = header_elems[0]['text']
-            if len(header_elems) > 1:
-                 project_name += " " + header_elems[1]['text']
-
-        if not body_elems:
-             return self._empty_structure(project_name)
-
-        x_coords = np.array([e['center_x'] for e in body_elems]).reshape(-1, 1)
-        
-        # DBSCAN
-        eps = width * 0.15 
-        clustering = DBSCAN(eps=eps, min_samples=1).fit(x_coords)
-        
-        columns_map = {} 
-        for idx, label in enumerate(clustering.labels_):
-            if label not in columns_map: columns_map[label] = []
-            columns_map[label].append(body_elems[idx])
-
-        sorted_cols = []
-        for label, elems in columns_map.items():
-            avg_x = np.mean([e['center_x'] for e in elems])
-            sorted_cols.append({'elems': elems, 'x': avg_x})
-        
-        sorted_cols.sort(key=lambda c: c['x'])
-
-        final_columns = []
-        for i, col_data in enumerate(sorted_cols):
-            elems = col_data['elems']
-            elems.sort(key=lambda e: e['center_y'])
-            
-            col_name = elems[0]['text']
-            card_elems = elems[1:]
+            # detectar cards
+            cards = _find_cards_in_column(body)
 
             tasks = []
-            if card_elems:
-                current_card_texts = []
-                last_y = card_elems[0]['center_y']
-                last_h = card_elems[0]['height']
-                
-                for e in card_elems:
-                    gap = e['center_y'] - last_y
-                    threshold = max(last_h, e['height']) * 2.0 
-                    
-                    if gap > threshold and current_card_texts:
-                        tasks.append(self._parse_card(current_card_texts))
-                        current_card_texts = []
+            if cards:
+                card_imgs = []
+                for (cx, cy, cw, ch) in cards:
+                    card = body[cy:cy + ch, cx:cx + cw]
+                    card_imgs.append(cv2.cvtColor(card, cv2.COLOR_BGR2RGB))
 
-                    current_card_texts.append(e)
-                    last_y = e['center_y']
-                    last_h = e['height']
-                
-                if current_card_texts:
-                    tasks.append(self._parse_card(current_card_texts))
+                pred_groups = pipe.recognize(card_imgs)
 
-            final_columns.append({
+                for preds in pred_groups:
+                    words = _sort_reading_order(preds)
+
+                    # si la card es el botón "Agregar tarea", la ignoramos
+                    joined = " ".join(w.lower() for w in words)
+                    if "agregar" in joined and "tarea" in joined:
+                        continue
+
+                    tasks.append(_parse_task_from_words(words))
+
+            out_cols.append({
                 "nombre": col_name,
-                "orden": i + 1,
+                "orden": len(out_cols) + 1,
                 "tasks": tasks
             })
 
+        # shape compatible con tu mapper del front
         return {
             "project": {
-                "nombre": project_name,
+                "nombre": "Proyecto (desde imagen)",
                 "descripcion": None,
                 "estado": "Activo",
                 "fechaInicio": None,
                 "fechaFin": None
             },
-            "columns": final_columns
+            "columns": out_cols
         }
-
-    def _parse_card(self, elements):
-        full_text = " ".join([e['text'] for e in elements])
-        prioridad = "MEDIA"
-        if "alta" in full_text.lower(): prioridad = "ALTA"
-        elif "baja" in full_text.lower(): prioridad = "BAJA"
-        
-        return {
-            "titulo": elements[0]['text'], 
-            "descripcion": " ".join([e['text'] for e in elements[1:]]) if len(elements)>1 else None,
-            "prioridad": prioridad,
-            "puntos": 0,
-            "fechaLimite": None
-        }
-
-    def _empty_structure(self, name="Sin Nombre"):
-        return {
-            "project": {"nombre": name, "estado": "Activo"},
-            "columns": []
-        }
-
-    # --- GEMINI FALLBACK LOGIC ---
-    def _call_gemini_fallback(self, image_bytes):
-        base_url = 'https://generativelanguage.googleapis.com'
-        model = 'gemini-2.0-flash' # Or 1.5-flash, trying a robust one
-        url = f"{base_url}/v1beta/models/{model}:generateContent?key={self.gemini_key}"
-        
-        prompt = '''
-        Eres un extractor OCR + estructurador de tableros Kanban.
-        A partir de la imagen, detecta: nombre del proyecto, columnas y tareas.
-        Responde SOLO en JSON válido con este esquema:
-        {
-          "project": { "nombre": "string", "descripcion": "string", "estado": "Activo", "fechaInicio": "string", "fechaFin": "string" },
-          "columns": [
-            { "nombre": "string", "orden": 1, "tasks": [ { "titulo": "string", "descripcion": "string", "prioridad": "BAJA|MEDIA|ALTA", "puntos": 0, "fechaLimite": "YYYY-MM-DD" } ] }
-          ]
-        }
-        '''
-        
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inlineData": {
-                            "mimeType": "image/jpeg",
-                            "data": base64.b64encode(image_bytes).decode('utf-8')
-                        }
-                    }
-                ]
-            }]
-        }
-        
-        resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
-        if resp.status_code != 200:
-            raise Exception(f"Gemini API Error {resp.status_code}: {resp.text}")
-            
-        return self._parse_gemini_response(resp.json())
-
-    def _parse_gemini_response(self, data):
-        try:
-            candidates = data.get('candidates', [])
-            if not candidates: return self._empty_structure("Error Gemini")
-            
-            text_part = candidates[0]['content']['parts'][0]['text']
-            # Strip fences
-            cleaned = text_part.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[-1].rsplit("\n", 1)[0]
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:].strip()
-                
-            return json.loads(cleaned)
-        except Exception as e:
-            print(f"Error parsing Gemini JSON: {e}")
-            return self._empty_structure("Error Parsing")

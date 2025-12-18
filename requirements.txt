@@ -6,8 +6,8 @@ scikit-learn
 SQLAlchemy
 PyMySQL
 python-dotenv
-tensorflow
-keras-ocr
+tensorflow==2.15.0.post1
+keras-ocr==0.9.3
 opencv-python-headless
 python-multipart
 requests
