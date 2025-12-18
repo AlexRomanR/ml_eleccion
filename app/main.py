@@ -6,11 +6,7 @@ from app.api.schema import schema
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://taskflowuagrm.netlify.app",
-        "http://localhost:4200",
-        "http://127.0.0.1:4200",
-    ],
+    allow_origins=["*"],
     allow_credentials=False,   # para GraphQL normal suele ir False
     allow_methods=["*"],
     allow_headers=["*"],
