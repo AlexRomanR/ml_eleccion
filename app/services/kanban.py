@@ -2,7 +2,7 @@
 import re
 import cv2
 import numpy as np
-import keras_ocr
+
 
 _PIPELINE = None
 
@@ -18,6 +18,7 @@ PRIORITY_MAP = {
 def _get_pipeline():
     global _PIPELINE
     if _PIPELINE is None:
+        import keras_ocr  # ✅ lazy import (NO se carga en el arranque)
         _PIPELINE = keras_ocr.pipeline.Pipeline()
     return _PIPELINE
 

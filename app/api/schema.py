@@ -1,16 +1,41 @@
-import strawberry
+# app/api/schema.py
 import base64
 import typing
-import json
-from strawberry.scalars import JSON
-from app.services.uml import UMLGeneratorDeepLearning, UMLGeneratorGemini
-from app.services.kanban import KanbanExtractor
-from app.services.anomalies import run_anomaly_scan
+from functools import lru_cache
 
-# Instanciar servicios
-uml_local = UMLGeneratorDeepLearning()
-uml_gemini = UMLGeneratorGemini()
-kanban_extractor = KanbanExtractor()
+import strawberry
+from strawberry.scalars import JSON
+
+
+# ---------------------------
+# Lazy singletons (cacheados)
+# ---------------------------
+
+@lru_cache(maxsize=1)
+def _get_uml_local():
+    # ✅ Importa recién cuando se usa (evita cargar TensorFlow en el arranque)
+    from app.services.uml import UMLGeneratorDeepLearning
+    return UMLGeneratorDeepLearning()
+
+@lru_cache(maxsize=1)
+def _get_uml_gemini():
+    from app.services.uml import UMLGeneratorGemini
+    return UMLGeneratorGemini()
+
+@lru_cache(maxsize=1)
+def _get_kanban_extractor():
+    from app.services.kanban import KanbanExtractor
+    return KanbanExtractor()
+
+def _run_anomaly_scan(project_id: int, contamination: float):
+    # ✅ También lo hacemos lazy (pandas/sklearn)
+    from app.services.anomalies import run_anomaly_scan
+    return run_anomaly_scan(project_id, contamination)
+
+
+# ---------------------------
+# Types
+# ---------------------------
 
 @strawberry.type
 class UMLClass:
@@ -47,6 +72,11 @@ class ScanResponse:
     project_id: int
     anomalies: typing.List[AnomalyItem]
 
+
+# ---------------------------
+# Query / Mutation
+# ---------------------------
+
 @strawberry.type
 class Query:
     @strawberry.field
@@ -55,28 +85,30 @@ class Query:
 
     @strawberry.field
     def scan_anomalies(self, project_id: int, contamination: float = 0.1) -> ScanResponse:
-        results = run_anomaly_scan(project_id, contamination)
-        
-        # Mapear diccionarios a objetos
-        anomalies_objs = []
+        results = _run_anomaly_scan(project_id, contamination)
+
+        anomalies_objs: typing.List[AnomalyItem] = []
         for item in results:
-            summary_data = item['resumen']
-            anomalies_objs.append(AnomalyItem(
-                tarea_id=item['tarea_id'],
-                score=item['score'],
-                motivos=item['motivos'],
-                sugerencia=item['sugerencia'],
-                resumen=AnomalySummary(
-                    dias_sin_mov=summary_data['dias_sin_mov'],
-                    back_moves=summary_data['back_moves'],
-                    reopen_expl=summary_data['reopen_expl'],
-                    cycle_days=summary_data['cycle_days'],
-                    prioridad=summary_data['prioridad'],
-                    puntos=summary_data['puntos']
+            summary_data = item["resumen"]
+            anomalies_objs.append(
+                AnomalyItem(
+                    tarea_id=item["tarea_id"],
+                    score=item["score"],
+                    motivos=item["motivos"],
+                    sugerencia=item["sugerencia"],
+                    resumen=AnomalySummary(
+                        dias_sin_mov=summary_data["dias_sin_mov"],
+                        back_moves=summary_data["back_moves"],
+                        reopen_expl=summary_data["reopen_expl"],
+                        cycle_days=summary_data["cycle_days"],
+                        prioridad=summary_data["prioridad"],
+                        puntos=summary_data["puntos"],
+                    ),
                 )
-            ))
-            
+            )
+
         return ScanResponse(project_id=project_id, anomalies=anomalies_objs)
+
 
 @strawberry.type
 class Mutation:
@@ -86,55 +118,56 @@ class Mutation:
             if "," in image_base64:
                 image_base64 = image_base64.split(",")[1]
             image_bytes = base64.b64decode(image_base64)
-            
+
+            # ✅ se instancia recién aquí
             if use_gemini:
-                result = uml_gemini.process(image_bytes)
+                result = _get_uml_gemini().process(image_bytes)
             else:
-                result = uml_local.process(image_bytes)
-            
-            if "error" in result and result.get("error"):
+                result = _get_uml_local().process(image_bytes)
+
+            if result.get("error"):
                 return UMLResponse(
                     method=result.get("method", "Unknown"),
                     classes=[],
                     generated_code="",
-                    error=result["error"]
+                    error=result["error"],
                 )
 
-            classes_objs = []
+            classes_objs: typing.List[UMLClass] = []
             for cls_data in result.get("classes", []):
-                classes_objs.append(UMLClass(
-                    name=cls_data.get("name", "Unknown"),
-                    attributes=cls_data.get("attributes", []),
-                    methods=cls_data.get("methods", [])
-                ))
+                classes_objs.append(
+                    UMLClass(
+                        name=cls_data.get("name", "Unknown"),
+                        attributes=cls_data.get("attributes", []),
+                        methods=cls_data.get("methods", []),
+                    )
+                )
 
             return UMLResponse(
                 method=result.get("method", "Unknown"),
                 classes=classes_objs,
                 generated_code=result.get("generated_code", ""),
-                error=None
+                error=None,
             )
         except Exception as e:
             return UMLResponse(
                 method="Error",
                 classes=[],
                 generated_code="",
-                error=f"Internal Server Error: {str(e)}"
+                error=f"Internal Server Error: {str(e)}",
             )
 
     @strawberry.mutation
     def extract_kanban(self, image_base64: str) -> JSON:
-        """
-        Retorna la estructura del tablero Kanban como un objeto JSON arbitrario
-        debido a la complejidad y profundidad variable de la respuesta.
-        """
         try:
             if "," in image_base64:
                 image_base64 = image_base64.split(",")[1]
             image_bytes = base64.b64decode(image_base64)
-            
-            return kanban_extractor.extract_from_bytes(image_bytes)
+
+            # ✅ se instancia recién aquí
+            return _get_kanban_extractor().extract_from_bytes(image_bytes)
         except Exception as e:
             return {"error": str(e)}
+
 
 schema = strawberry.Schema(query=Query, mutation=Mutation)
