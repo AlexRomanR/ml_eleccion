@@ -4,7 +4,7 @@ pandas
 numpy<2.0
 scikit-learn
 SQLAlchemy
-PyMySQL
+psycopg2-binary
 python-dotenv
 tensorflow==2.15.0.post1
 keras-ocr==0.9.3

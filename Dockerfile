@@ -27,8 +27,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY . .
 
 # Exponer el puerto 5000 (donde correrá FastAPI/Uvicorn)
+# Exponer puerto 5000 (por defecto, para desarrollo local)
 EXPOSE 5000
 
-# Comando de arranque: Uvicorn sirviendo la app "app" desde "app.py"
-# Se usa --host 0.0.0.0 para que sea accesible desde fuera del contenedor
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5000"]
+# Comando de arranque para Cloud Run
+# Cloud Run inyecta la variable de entorno $PORT (por defecto 8080)
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-5000}
