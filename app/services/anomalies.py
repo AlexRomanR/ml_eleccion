@@ -19,7 +19,7 @@ last_move AS (
 ),
 dias_sin AS (
   SELECT t.id AS tarea_id,
-         TIMESTAMPDIFF(DAY, lm.last_change, NOW()) AS dias_sin_mov
+         EXTRACT(DAY FROM NOW() - lm.last_change) AS dias_sin_mov
   FROM last_move lm
   JOIN tarea t ON t.id = lm.tarea_id
   WHERE t.proyecto_id = :proyectoId
@@ -59,7 +59,7 @@ cycle AS (
   SELECT t.id AS tarea_id,
          CASE
            WHEN fi.fecha_fin IS NOT NULL AND si.fecha_inicio IS NOT NULL
-           THEN TIMESTAMPDIFF(DAY, si.fecha_inicio, fi.fecha_fin)
+           THEN EXTRACT(DAY FROM fi.fecha_fin - si.fecha_inicio)
            ELSE NULL
          END AS cycle_days
   FROM tarea t
