@@ -6,10 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # Instalar dependencias del sistema necesarias para OpenCV y compilación básica
-# libgl1-mesa-glx y libglib2.0-0 son CRÍTICAS para que cv2 funcione en Docker
+# libgl1 y libglib2.0-0 son CRÍTICAS para que cv2 funcione en Docker
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
